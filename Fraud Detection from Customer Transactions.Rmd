@@ -1,0 +1,1949 @@
+---
+title: "Fraud Detection from Customer Transaction"
+author: "Seyoung Jung"
+date: "08/03/2020"
+output: rmarkdown::github_document
+---
+
+
+```{r, echo = FALSE}
+knitr::opts_chunk$set(
+  fig.path = "README_figs/README-"
+)
+```
+
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+***
+
+
+# 1 Introduction
+
+Today, due to the development of digital payments, less people are carrying cash. According to this news article titled [More Americans say they don't carry cash](https://www.cnbc.com/2019/01/15/more-americans-say-they-dont-carry-cash.html), "in an average week, roughly 3 in 10 adults said they make zero purchases using cash". Also it mentions that "millennials are paving the way among people ditching bills and coins in favor or credit, debit and digital payments, through apps like Apple Pay, Venmo, and Zelle." Digital payments are very convenient; you don't have to carry your fat wallet anymore, and most importantly, it allows you to shop online. Especially during this ongoing global pandemic of COVID-19, the online consumer market is growing exponentially to avoid physical contact with others. 
+
+However, this digital payment system has a serious problem; exposure to fraud transactions. And this [article](https://www.paymentssource.com/opinion/coronavirus-increases-exposure-for-digital-payments-fraud) suggests that "coronavirus increases exposure for digital payments fraud." Such fraud tranasctions 
+So, many experts are trying to develop methods to decrease the number of fraud transactions. 
+
+In this project, we build models that predict whether a transaction is a fraud. The dataset used for this project can be found [here](https://www.kaggle.com/c/ieee-fraud-detection/data). In this project, we use only training set to see how well our models classify fraud transactions. 
+
+
+***
+
+# 2 Preparation
+
+We will load packages we need for this project. 
+```{r, message = FALSE, warning = FALSE}
+library(readr)        # read_csv
+library(dplyr)        # glimpse
+library(stringr)      # str_c, str_sub
+library(ggplot2)      # ggplot
+library(scales)       # label = comma
+library(gridExtra)    # grid.arrange
+library(tidyr)
+library(janitor)      # remove_constant
+library(magrittr)     # %<>% pipeline
+library(forcats)      # fct_lump
+library(lightgbm)
+library(Matrix)       #s parse.model.matrix
+```
+
+And read dataset into R. Before we join the two dataset, we will create a new column called "isID" to identify which rows are from id_data. 
+```{r, message = FALSE}
+txn_data <- read_csv("fraud_detection_transaction.csv", n_max=600000)
+id_data <- read_csv("fraud_detection_identity.csv", n_max=150000)
+txn_data$isID <- NA
+id_data$isID <- 1
+```
+
+
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+options(scipen = 999)
+```
+
+Join txn_data and id_data, by "TransactionID". 
+```{r, message = FALSE, warning = FALSE}
+data_joined <- left_join(txn_data, id_data, by = "TransactionID")
+data_joined$isID.x <- NULL    
+names(data_joined)[names(data_joined) == "isID.y"] <- "isID"
+data_joined$isID[is.na(data_joined$isID)] <- 0
+```
+
+Let's have a look at the structure of the datasets
+```{r, message = FALSE, warning = FALSE}
+glimpse(data_joined)  # 590540 obs. of  435 variables
+```
+
+
+Let's find out how many features are constant features. 
+```{r, message = FALSE}
+nonconstant_data <- remove_constant(data_joined, na.rm = FALSE, quiet = TRUE)
+removed_columns <- setdiff(names(data_joined), names(nonconstant_data))
+paste0(length(removed_columns), " features are constant")
+```
+
+There are 3 different types of missing variables in our character variables: "NotFound", "Unknown", and NA. Let's unify them. 
+```{r, message = FALSE, warning = FALSE}
+char_variables <- names(data_joined)[sapply(data_joined, class) == "character"]
+missingvals <- function(x) x %in% c("NotFound", "Unknown", "<NA>")
+data_joined[, char_variables] %<>% mutate_all(funs(ifelse(missingvals(.), NA, .)))
+```
+
+
+
+The ratio of the target variable is as follows. You can see that 96.5% of the transactions were not fraud
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+table(data_joined$isFraud, useNA = 'ifany')/nrow(data_joined)     
+```
+
+
+
+And the following is the ratio of NA's in each column from the dataset. We can see that most of features that have NA's in their rows are from id or V features. 
+```{r, message = FALSE, warning = FALSE}
+NA_data <- sapply(data_joined, function(x) {sum(is.na(x))/length(x)})
+NA_data[order(-NA_data)]  %>% head(100) 
+```
+
+We can see that no TransactionID's are duplicated. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+which(duplicated(data_joined$TransactionID)==TRUE)   # integer(0)
+```
+
+Data sampling (75%: Training set / 25%: Test set) 
+```{r, message = FALSE, warning = FALSE}
+sample_size <- floor(0.75 * nrow(data_joined))
+set.seed(93)
+sampling_data <- sample(seq_len(nrow(data_joined)), size = sample_size)
+train_set <- data_joined[sampling_data, ]
+test_set <- data_joined[-sampling_data, ]
+```
+
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+paste0("There are ", nrow(train_set), " and ", nrow(test_set), " observations in training and test set, respectively.")
+```
+
+The ratio of the target variable of the two new datasets
+```{r, message = FALSE, warning = FALSE}
+table(train_set$isFraud, useNA = 'ifany')/nrow(train_set)       # training set
+table(test_set$isFraud, useNA = 'ifany')/nrow(test_set)         # test set
+```
+
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+rm(id_data, txn_data, sample_size, sampling_data, nonconstant_data, data_joined)
+```
+
+
+
+
+
+***
+
+
+# 3 Exploratory Data Analysis
+
+The following is the description of the dataset. 
+
+In this section, we will take a close look at out dataset. We will try to find patterns using visualizations and tables. The following is the description of the dataset, and they were directly excerpted from [here](https://www.kaggle.com/c/ieee-fraud-detection/discussion/101203). But please note that detailed  description is not available. 
+
+
+* __TransactionDT__: timedelta from a given reference datetime (not an actual timestamp)
+* __TransactionAMT__: transaction payment amount in USD
+* __ProductCD__: product code, the product for each transaction 
+* __card1 - card6__: payment card information, such as card type, card category, issue bank, country, etc. 
+* __addr__: address
+* __dist__: distance
+* __P_ and (R__) emaildomain__: purchaser and recipient email domain
+* __C1-C14__: counting, such as how many addresses are found to be associated with the payment card, etc. The actual meaning is masked
+* __D1-D15__: timedelta, such as days between previous transaction, etc.
+* __M1-M9__: match, such as names on card and address, etc.
+* __Vxxx__: Vesta engineered rich features, including ranking, counting, and other entity relations.
+
+
+### TransactionDT
+
+
+```{r, message = FALSE, warning = FALSE}
+paste0("The ranges of time delta of fraudulent transactions and legit transactions from training set are ", round((max(train_set$TransactionDT[train_set$isFraud==1]) - min(train_set$TransactionDT[train_set$isFraud==1]))/(60*60*24), digits=2), " days and ", round((max(train_set$TransactionDT[train_set$isFraud==0]) - min(train_set$TransactionDT[train_set$isFraud==0]))/(60*60*24), digits=2), " days, respectively.")
+```
+
+The distribution of TransactionDT in terms of isFraud is quite different. The density of TransactionDT when isFraud=1 is more evenly distributed than when isFraud=0. We can speculate that legit transactions are made with relatively shorter time delta at around 2,000,000. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+train_set %>% 
+  ggplot(aes(x=TransactionDT, color=as.factor(isFraud))) +
+  geom_density(size=1)+
+  scale_x_continuous(breaks=seq(80000, 16000000, by=1000000), label=comma) +
+  guides(color=guide_legend(title="isFraud")) +
+  labs(title="Time Delta by Transactions",x="Time Delta", y = "Density") +
+  scale_color_brewer(palette="Dark2") + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) 
+```
+
+
+
+
+
+
+
+
+
+### TransactionAMT
+
+Let's first take a look at the quantile of this feature.
+There is no missing variable in TransactionAMT variable. And as you can see the list of quantiles, 90% of the amounts are less than 300 dollars, and 95% of them are less than 445 dollars. However, it indicates that the highest amount is rounghly $31,937 which is a lot higher than the rest.
+```{r, message = FALSE, warning = FALSE}
+quantile(train_set$TransactionAmt, probs = seq(0, 1, 1/20))
+```
+
+The tail function shows us that even there is a stark difference between the two highest values and the rest. 
+```{r, message = FALSE, warning = FALSE}
+tail(sort(train_set$TransactionAmt), 20)   
+```
+
+If you take a closer look at the two corresponding rows, you will see that the two rows are basically the same except for the TransactionID. We can speculate that the two transactions were made by the same person with the same credit card to purchase the same items, etc.   
+```{r, message = FALSE, warning = FALSE}
+highest_amt <- which(train_set$TransactionAmt==tail(sort(train_set$TransactionAmt), 2))
+head(train_set[highest_amt, ]) 
+```
+
+The transaction amounts are very right-skewed. Almost all of the transactions were made under $500. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, , fig.height =4, fig.width = 10}
+ggplot(train_set, aes(x=TransactionAmt)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", binwidth=1) +
+  scale_x_continuous(breaks=seq(0, 2000, by=200), label=comma) +
+  scale_y_continuous(labels = comma) +
+  coord_cartesian(x=c(0, 2000)) +
+  labs(x="Transaction Amount", y="Number of Transactions") +
+  ggtitle("Frequency Histogram of Transaction Amount") +
+  theme_bw() 
+```
+
+
+If you use the log transformation, the data conforms to normality, and it is centered around 4. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+ggplot(train_set, aes(x=log(TransactionAmt))) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", binwidth=0.01,  alpha = 0.3) +
+  scale_x_continuous(label=comma) +
+  scale_y_continuous(labels = comma) +
+  labs(x="Transaction Amount", y="Number of Transactions") +
+  ggtitle("Transaction Amount with Log Transformation") +
+  theme_bw()
+```
+
+
+Of course, TransactionAmt vs. isFraud is very skewed. However, the distribution of the transaction amounts when the transactions were legit is much more skewed to the right when they were fraudulent. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+train_set %>% filter(TransactionAmt < 2000) %>% 
+  ggplot(aes(x=TransactionAmt, color=as.factor(isFraud))) +
+  geom_density(size=0.8)+
+  guides(color=guide_legend(title="isFraud")) +
+  labs(title="Transaction Amount by isFraud",x="Transaction Amount ($)", y = "Density", subtitle="when transaction amounts are less than $2,000") +
+  scale_x_continuous(label=comma) +
+  scale_color_brewer(palette="Dark2") + 
+  theme_minimal() 
+```
+
+
+The log transformation makes the distribution a lot less skewed. It is remarkable that the transaction amounts when the transactions were fraudulent are more evenly distributed.  
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+train_set %>% filter(TransactionAmt < 2000) %>% 
+  ggplot(aes(x=log(TransactionAmt), color=as.factor(isFraud))) +
+  geom_density(size=0.8)+
+  guides(color=guide_legend(title="isFraud")) +
+  labs(title="Log Transformed Transaction Amount by isFraud",x="Log Transformed Transaction Amount ($)", y = "Density", subtitle="when transaction amounts are less than $2,000") +
+  scale_x_continuous(label=comma) +
+  scale_color_brewer(palette="Dark2") + 
+  theme_minimal()
+```
+
+
+
+Also, you can reasonably suspect that the transaction amounts that have three decimal places were made outside the United States because of an exchange rate. Let’s compare TransactionAMT to addr2 (billing country). First, identify which columns have nonzero value on the third decimal place and then create the proportion in table. 
+```{r, message = FALSE, warning = FALSE}
+TransactionAmt_chr <- str_sub(format(round(train_set$TransactionAmt, 3), nsmall=3), start=-1)
+which_TransactionAmt_chr <- which(TransactionAmt_chr != 0)
+only_TransactionAmt_chr <- train_set[which_TransactionAmt_chr, ]
+table(train_set$addr2, useNA = 'ifany')/nrow(train_set)
+
+```
+
+If you compare this dataset to the original dataset, you will easily see that many values (e.g. 10, 17, 20, …) are gone, and the proportion of NA’s is significantly increased from 0.1112 to 0.9509. Also, in the original dataset, the proportion of “87” was 0.881. But the proportion from the new dataset is only 0.0009. 
+```{r, message = FALSE, warning = FALSE}
+table(only_TransactionAmt_chr$addr2, useNA = 'ifany')/nrow(only_TransactionAmt_chr)
+```
+
+isFraud rate when TranscationAmt has three decimal places. We can speculate that the transaction amounts that have three decimal places might have higher fraudulent rate. As you can see that table, the fraudulent rate is 11.65% (the fraudulent rate of the entire dataset was 3.49%)
+```{r, message = FALSE, warning = FALSE}
+table(only_TransactionAmt_chr$isFraud, useNA='ifany') / nrow(only_TransactionAmt_chr)
+```
+
+As you can see the boxplots, the interquartile ranges of the product codes are very similar; they are formed near 0 dollar. However, the outside values are vary widely by product codes. For instance, the product code "W" has the widest range of outside values, followed by "R", "S", "C", and "H". We can interpret this as follows; the products related to the product code "W" could be sometimes relatively more expensive, and the products related to the code "H" normally cost up to $500 which is a lot less than that of "W". 
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+ggplot(train_set[-c(114009, 312068), ], aes(x = ProductCD, y = TransactionAmt)) + 
+  geom_boxplot() + 
+  coord_flip() +
+  scale_y_continuous(breaks=seq(0, 7000, by=1000), label=comma) +
+  labs(x="Product Code", y="Transaction Amount ($)") +
+  ggtitle("Transaction Amount by Product Code") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+rm(highest_amt, only_TransactionAmt_chr, TransactionAmt_chr, which_TransactionAmt_chr)
+```
+
+
+
+
+
+
+### Product Code
+
+"W" has the highest frequency (74.49%), followed by "C" (11.59%), "R" (6.37%), "H" (5.57%), and "S" (1.96%). 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+ProductCD_freq <- train_set %>% group_by(ProductCD) %>% summarise(counts=n())
+ggplot(ProductCD_freq, aes(x = ProductCD, y = counts)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.4) + 
+  geom_text(aes(label = counts), vjust = -0.2) +
+  labs(x="Product Code", y="Number of Transactions") +
+  ggtitle("Barplot of Product Code") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() 
+```
+
+
+If you look at this table, the proportion of a transaction being fraudulent is differed by product code, expecially "C" and "W". For example, when a transaction is fraud, the density of "C" is 38.4%, however, it is 10.6% when the transaction is actually legit. 
+```{r, message = FALSE, warning = FALSE}
+ProductCD_isFraud <- train_set %>% group_by(isFraud, ProductCD) %>% tally() %>% 
+  complete(ProductCD, fill = list(n = 0)) %>% 
+  mutate(percentage = n / sum(n) * 100)
+ProductCD_isFraud
+```
+
+
+However, if we only look at the data originally from "id_data", we can see that, surprisingly, the product code "W" is all gone, when it takes takes up about 75% in the combined data. We can speculate that the product code "W" is not pertinent to the transaction data which record the variables "id_01", "id_02", ..., "id_38", "DeviceType", and "DeviceInfo". 
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+ProductCD_isID_0 <- train_set[train_set$isID==0, ] %>% group_by(ProductCD) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+ProductCD_isID_1 <- train_set[train_set$isID==1, ] %>% group_by(ProductCD) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+
+plot1 <- ggplot(ProductCD_isID_0, aes(x = reorder(ProductCD, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(title="Percentiles by Product Code", subtitle="From the txn_data", x="Product Code", y="") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal()
+
+plot2 <- ggplot(ProductCD_isID_1, aes(x = reorder(ProductCD, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.5) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(title="Percentiles by Product Code", subtitle="From the id_data", x="Product Code", y="") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal()
+
+grid.arrange(plot1, plot2, ncol=2)
+```
+
+
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+rm(ProductCD_freq, ProductCD_isFraud, ProductCD_isID_0, ProductCD_isID_1, plot1, plot2)
+```
+
+
+
+### Card
+> In this dataset, there are 6 different features related to card information. We will explore those features in this section. 
+
+
+#### Card 1
+
+As the plot below shows, the distribution of card1 when the transactions are fraudulent are different than that of card1 when the transactions are not fraudulent. When they are fraudulent, card1 is highest around 10,000 and it is highest around 7,800 when the transactions are not fraudulent. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+train_set %>%  
+  ggplot(aes(x=card1, color=as.factor(isFraud))) +
+  geom_density(size=0.8)+
+  guides(color=guide_legend(title="isFraud")) +
+  labs(title="Card 1 Information by isFraud",x="Card 1 Info", y = "Density") +
+  scale_x_continuous(label=comma) +
+  scale_color_brewer(palette="Dark2") + 
+  theme_minimal() 
+```
+
+
+#### Card 2
+As card1, card2 shows two dissimilar graphs. The green graph has relatively lower peaks than that of the red graph. We can say that when transactions are fraudulent, the card2 information is relatively more evenly distributed than when the transactions are not fraudulent. However, both graphs have many curves. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+train_set %>%  
+  ggplot(aes(x=card2, color=as.factor(isFraud))) +
+  geom_density(size=0.8)+
+  guides(color=guide_legend(title="isFraud")) +
+  labs(title="Card 2 Information by isFraud",x="Card 2 Info", y = "Density") +
+  scale_x_continuous(label=comma) +
+  scale_color_brewer(palette="Dark2") + 
+  theme_minimal() 
+```
+
+
+#### Card 3
+The graphs below have four peaks; two at 150 and the other two at 185. But it is remarkable that, the fraud rate at 150 is much lower. But at 185, the fraud rate is higher. So we have to watch those two points carefully when analyzing this dataset.
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+train_set %>%  
+  ggplot(aes(x=card3, color=as.factor(isFraud))) +
+  geom_density(size=0.8)+
+  guides(color=guide_legend(title="isFraud")) +
+  labs(title="Card 3 Information by isFraud",x="Card 3 Info", y = "Density") +
+  scale_x_continuous(label=comma) +
+  scale_color_brewer(palette="Dark2") + 
+  theme_minimal() 
+```
+
+
+
+#### Card 4
+card4 has four different types of cards; American Express, Discover, Mastercard, and Visa. And the feature has relatively low NA proportion. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+card4_freq <- train_set %>% group_by(card4) %>% summarise(counts=n())
+ggplot(card4_freq, aes(x = reorder(card4, -counts), y = counts)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = counts), vjust = -0.2) +
+  labs(title="Transactions by Card 4 Information", subtitle="Credit Card Networks",
+  x="Credit Card Networks", y="") +
+  scale_y_continuous(labels = comma) + 
+  theme_classic()
+```
+
+The proportion of Mastercard when the tranactions are normal is slightly higher (32%) than when they are fraudulent (31%). But the proportion of Discover is lower (1%). 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+card4_isFraud_0 <- train_set[train_set$isFraud==0, ] %>% group_by(card4) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) *100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+card4_isFraud_1 <- train_set[train_set$isFraud==1, ] %>% group_by(card4) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) *100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+theme_set(theme_classic())
+plot1 <- ggplot(card4_isFraud_0, aes(x = reorder(card4, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.2) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  scale_x_discrete(labels=c("Visa", "MC", "AMEX", "Discover", "NA")) +
+  labs(title="Normal Transactions", x="", y="") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+theme_set(theme_classic())
+plot2 <- ggplot(card4_isFraud_1, aes(x = reorder(card4, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.5) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  scale_x_discrete(labels=c("Visa", "MC", "Discover", "AMEX", "NA")) +
+  labs(title="Fraudulent Transactions", x="", y="") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+grid.arrange(plot1, plot2, ncol=2)
+```
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+rm(plot1, plot2, card4_freq, card4_isFraud_0, card4_isFraud_1)
+```
+
+
+
+#### Card 5
+
+The distribution of the two graphs are somewhat different. Both of them have the highest density around 226. At 226, the green graph is higher but narrower than the orange graph. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+train_set %>%  
+  ggplot(aes(x=card5, color=as.factor(isFraud))) +
+  geom_density(size=0.8)+
+  guides(color=guide_legend(title="isFraud")) +
+  labs(title="Card 5 Information by isFraud",x="Card 5 Info", y = "Density") +
+  scale_x_continuous(label=comma) +
+  scale_color_brewer(palette="Dark2") + 
+  theme_minimal() 
+```
+
+
+
+#### Card 6
+card6 has 5 different categories including NA; charge card, credit, debit, debit or credit, and NA. As the table shows, debit (74%) is the most frequently used payment card followed by credit (25%). The other categories take up very little portion. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+card6_freq <- train_set %>% group_by(card6) %>% summarise(counts=n())
+ggplot(card6_freq, aes(x = reorder(card6, -counts), y = counts)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = counts), vjust = -0.2) +
+  labs(title="Transactions by Card 6 Information", subtitle="Payment Methods",
+  x="Payment Methods", y="") +
+  scale_y_continuous(labels = comma) + 
+  theme_classic()
+```
+
+Interestingly, even though the proportion of debit cards take up the highest proportion (75%) in the original dataset, the proportion when the transactions are fraudulent converges to 0%. And the proportions of charge cards and credit cards show a steep rise to 48% and 52%, respectively. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+card6_isFraud_0 <- train_set[train_set$isFraud==0, ] %>% group_by(card6) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) *100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+card6_isFraud_1 <- train_set[train_set$isFraud==1, ] %>% group_by(card6) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) *100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+theme_set(theme_classic())
+plot1 <- ggplot(card6_isFraud_0, aes(x = reorder(card6, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.2) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  scale_x_discrete(labels=c("Debit", "Credit", "Charge Card", "D or C", "NA")) +
+  labs(title="Normal Transactions", x="", y="") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+theme_set(theme_classic())
+plot2 <- ggplot(card6_isFraud_1, aes(x = reorder(card6, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.5) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  scale_x_discrete(labels=c("Credit", "Charge Card", "Debit", "D or C", "NA")) +
+  labs(title="Fraudulent Transactions", x="", y="") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+ 
+grid.arrange(plot1, plot2, ncol=2)
+```
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+rm(plot1, plot2, card6_freq, card6_isFraud_0, card6_isFraud_1)
+```
+
+
+
+
+### Address 
+> This section contains two subsections; Address 1 and Address 2. 
+
+#### Address 1
+This feature ranges from 100 to 540 with 49254 NA's.
+```{r, message = FALSE, warning = FALSE}
+summary(train_set$addr1)
+```
+
+When the value of this feature is NA, the proportion of fraudulent transactions increases to 11.65% which is approximately 8% higher than the proportion from the original dataset.
+```{r, message = FALSE, warning = FALSE}
+addr1_na <- which(is.na(train_set$addr1))
+table(train_set[addr1_na, 2]) / length(addr1_na)
+```
+
+The two graphs have similar trends. However, the green graph has higher and narrower shapes than the orange graph. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+train_set %>%  
+  ggplot(aes(x=addr1, color=as.factor(isFraud))) +
+  geom_density(size=0.8)+
+  guides(color=guide_legend(title="isFraud")) +
+  labs(title="Address 1 Information by isFraud", subtitle="Billing Region", x="Billing Region", y ="Density") +
+  scale_x_continuous(label=comma) +
+  scale_color_brewer(palette="Dark2") + 
+  theme_minimal() 
+```
+
+#### Address 2
+Address 2 has the same number of NA's as Address 1 has, but it ranges from 10 to 102 which is narrower than Address 1. 
+```{r, message = FALSE, warning = FALSE}
+summary(train_set$addr2)
+```
+
+Interestingly, the proportion of fraudulent transactions increases to 11.65% as Address 1 does. 
+```{r, message = FALSE, warning = FALSE}
+addr2_na <- which(is.na(train_set$addr2))
+table(train_set[addr2_na, 2]) / length(addr2_na)
+```
+
+The value 87 which has the highest frequency takes up 88% of the total. Everywhere except where the value of Address 2 is 87 is almost flat. At 87, the green graph has higher and narrower shape. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+train_set %>%  
+  ggplot(aes(x=addr2, color=as.factor(isFraud))) +
+  geom_density(size=0.8)+
+  guides(color=guide_legend(title="isFraud")) +
+  labs(title="Address 2 Information by isFraud", subtitle="Billing Country", x="Billing Country",y="Density") +
+  scale_x_continuous(label=comma) +
+  scale_color_brewer(palette="Dark2") + 
+  theme_minimal()
+```
+
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+rm(addr1_na, addr2_na)
+```
+
+
+
+
+### Email Domain
+
+The below table based on P_emaildomain shows there are 60 different email domains including NA. Majority of people used gmail.com for their transactions
+```{r, message = FALSE, warning = FALSE}
+Pdomain_freq <- sort(table(train_set$P_emaildomain, useNA = 'ifany'), decreasing=T)
+Pdomain_freq
+```
+
+You can see that when the dataset has both P_emaildomain (purchaser) and R_emaildomain (recipient), the fraudulent rate goes up to 8.33%
+```{r, message = FALSE, warning = FALSE}
+emails_both <- complete.cases(train_set$P_emaildomain, train_set$R_emaildomain)
+table(train_set$isFraud[emails_both])/sum(emails_both)
+```
+
+However, when the dataset has none of them, the rate drops to 2.55%. 
+```{r, message = FALSE, warning = FALSE}
+emails_none <- which(is.na(train_set$P_emaildomain) & is.na(train_set$R_emaildomain))
+table(train_set$isFraud[emails_none])/length(emails_none)
+```
+
+This table shows the fraudulent rate of each of the email domains. The domain that has the highest fraudulent rate is protonmail.com, which has only 61% of legitimate transactions. In other words, the domain's fraudulent rate is approximately 39%. We should pay particular attention to the transactions that used these email domains. 
+```{r, message = FALSE, warning = FALSE}
+isFraud_by_domain <- rep(NA, length(Pdomain_freq))
+for(i in 1:length(Pdomain_freq)) {
+  if (is.na(names(Pdomain_freq))[i]) {
+    isFraud_by_domain[i] <- table(train_set$isFraud[is.na(train_set$P_emaildomain)])[[1]] / Pdomain_freq[[i]]
+  }
+  else {
+    isFraud_by_domain[i] <- table(train_set$isFraud[train_set$P_emaildomain == names(Pdomain_freq[i])])[[1]] / Pdomain_freq[[i]]
+  }
+}
+names(isFraud_by_domain)[1:60] <- names(Pdomain_freq)[1:60]
+
+sort(isFraud_by_domain, decreasing=F)
+```
+
+
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+rm(Pdomain_freq, isFraud_by_domain, emails_both, emails_none)
+```
+
+
+
+
+
+
+### Devices
+
+> We have two different kinds of features related to devices used for transactions; device type and device information. 
+
+#### Device Type
+
+The two plots below indicate that when transactions are legit, 77% of device type information is not provided. But when transactions are fraudulent, NA rate drops to 46%. Also, there is a 5% of difference between desktop and mobile when transaction is legit, but it becomes almost the same when transcation is fraudulent. 
+```{r, message = FALSE, warning = FALSE, echo=FALSE, fig.height =4, fig.width = 10}
+DeviceType_isFraud_0 <- train_set[train_set$isFraud==0, ] %>% group_by(DeviceType) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) *100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+DeviceType_isFraud_1 <- train_set[train_set$isFraud==1, ] %>% group_by(DeviceType) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) *100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+
+plot1 <- ggplot(DeviceType_isFraud_0, aes(x = reorder(DeviceType, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.2) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  #scale_x_discrete(labels=c("NA", "Desktop", "Mobile")) +
+  labs(title="Device Type", subtitle="Normal Transactions", x="", y="") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme_minimal()
+
+plot2 <- ggplot(DeviceType_isFraud_1, aes(x = reorder(DeviceType, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.5) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  #scale_x_discrete(labels=c("NA", "Desktop", "Mobile")) +
+  labs(title="Device Type", subtitle="Fraudulent Transactions", x="", y="") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme_minimal()
+
+grid.arrange(plot1, plot2, ncol=2)
+
+rm(DeviceType_isFraud_0, DeviceType_isFraud_1, plot1, plot2)
+```
+
+
+
+
+#### Device Information
+
+
+```{r, message = FALSE, warning = FALSE}
+DeviceInfo_freq <- sort(table(train_set$DeviceInfo, useNA = 'ifany'), decreasing=T)
+DeviceInfo_freq %>% head(50)
+```
+
+We can see that there are too many levels with very few frequencies in this feature. We will group the features into the levels based on vendor. For example, both 'SM-J700M Build/MMB29K' and 'SM-G610M Build/MMB29K' are products of Samsung. We will mutate the levels to 'Samsung'. 
+```{r, message = FALSE, warning = FALSE}
+# Samsung
+train_set[grep("SM-", train_set$DeviceInfo), 'DeviceInfo'] <- "Samsung"
+train_set[grep("SAMSUNG", train_set$DeviceInfo), 'DeviceInfo'] <- "Samsung"
+test_set[grep("SM-", test_set$DeviceInfo), 'DeviceInfo'] <- "Samsung"
+test_set[grep("SAMSUNG", test_set$DeviceInfo), 'DeviceInfo'] <- "Samsung"
+
+# LG
+train_set[grep("LG", train_set$DeviceInfo), 'DeviceInfo'] <- "LG"
+test_set[grep("LG", test_set$DeviceInfo), 'DeviceInfo'] <- "LG"
+
+# rv 
+train_set[grep("rv:", train_set$DeviceInfo), 'DeviceInfo'] <- "rv"
+test_set[grep("rv:", test_set$DeviceInfo), 'DeviceInfo'] <- "rv"
+
+# Huawei
+train_set[grep("Huawei", train_set$DeviceInfo), 'DeviceInfo'] <- "Huawei"
+train_set[grep("HUAWEI", train_set$DeviceInfo), 'DeviceInfo'] <- "Huawei"
+train_set[grep("hi", train_set$DeviceInfo), 'DeviceInfo'] <- "Huawei"
+test_set[grep("Huawei", test_set$DeviceInfo), 'DeviceInfo'] <- "Huawei"
+test_set[grep("HUAWEI", test_set$DeviceInfo), 'DeviceInfo'] <- "Huawei"
+test_set[grep("hi", test_set$DeviceInfo), 'DeviceInfo'] <- "Huawei"
+
+# Motorola
+train_set[grep("Moto", train_set$DeviceInfo), 'DeviceInfo'] <- "Motorola"
+train_set[grep("moto", train_set$DeviceInfo), 'DeviceInfo'] <- "Motorola"
+train_set[grep("XT", train_set$DeviceInfo), 'DeviceInfo'] <- "Motorola"
+test_set[grep("Moto", test_set$DeviceInfo), 'DeviceInfo'] <- "Motorola"
+test_set[grep("moto", test_set$DeviceInfo), 'DeviceInfo'] <- "Motorola"
+test_set[grep("XT", test_set$DeviceInfo), 'DeviceInfo'] <- "Motorola"
+```
+
+
+We will keep 9 most frequently appeared levels, and lump the other levels into one level called "Other". 
+```{r, message = FALSE, warning = FALSE}
+train_set %<>% mutate(DeviceInfo=fct_lump(DeviceInfo, n=9))
+test_set %<>% mutate(DeviceInfo=fct_lump(DeviceInfo, n=9))
+```
+
+As you can see the plots below, transactions that were made using Samsung has a pretty higher fraud rate. In contrast, a factor level called "Trident/7.0" has a very low fraud rate. 
+```{r, message = FALSE, warning = FALSE, fig.height = 4.5, fig.width = 10, echo=FALSE}
+devinfo_freq <- train_set %>% group_by(DeviceInfo) %>% summarise(counts=n()) %>% arrange(desc(counts)) %>% head(10)
+plot1 <- ggplot(devinfo_freq, aes(x = reorder(DeviceInfo, counts), y = counts)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.4) + 
+  geom_text(aes(label = counts), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions by Device Info", subtitle="Including normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+fraud_devinfo_freq <- train_set[train_set$isFraud==1, ] %>% group_by(DeviceInfo) %>% summarise(counts=n()) %>% arrange(desc(counts)) %>% head(10)
+plot2 <- ggplot(fraud_devinfo_freq, aes(x = reorder(DeviceInfo, counts), y = counts)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.4) + 
+  geom_text(aes(label = counts), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions by Device Info", subtitle="Excluding normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2, devinfo_freq, fraud_devinfo_freq, DeviceInfo_freq)
+```
+
+
+
+
+
+### C
+
+> This dataset contains 14 different types of C; C1 - C14. And this subsection provides plots of C1, C2, C9, C11, C13, and C14. The other 8 C's are mostly have the value of 0. 
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% filter(C1 < 20) %>%
+  ggplot(aes(x=C1)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Sessions") +
+  ggtitle("C1 Information", subtitle="C1 Less Than 20") +
+  theme_bw() 
+
+plot2 <- train_set %>% filter(C2 < 20) %>%
+  ggplot(aes(x=C2)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Sessions") +
+  ggtitle("C2 Information", subtitle="C2 Less Than 20") +
+  theme_bw()
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% filter(C9 < 10) %>%
+  ggplot(aes(x=C9)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Sessions") +
+  ggtitle("C9 Information", subtitle="C9 Less Than 10") +
+  theme_bw() 
+
+plot2 <- train_set %>% filter(C11 < 15) %>%
+  ggplot(aes(x=C11)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Sessions") +
+  ggtitle("C11 Information", subtitle="C11 Less Than 15") +
+  theme_bw()
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2)
+```
+
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% filter(C13 < 100) %>%
+  ggplot(aes(x=C13)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Sessions") +
+  ggtitle("C13 Information", subtitle="C13 Less Than 100") +
+  theme_bw() 
+
+plot2 <- train_set %>% filter(C14 < 15) %>%
+  ggplot(aes(x=C14)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Sessions") +
+  ggtitle("C14 Information", subtitle="C14 Less Than 15") +
+  theme_bw()
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2)
+```
+
+
+
+
+
+
+
+### D
+
+> There are 15 different types of D in this dataset; D1 - D15. As the plots show, many of them have similar distributions. However, D4, D9, and D14 have quite different distributions. 
+
+```{r, message = FALSE, warning = FALSE, fig.height = 3, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% filter(D1 < 400) %>%
+  ggplot(aes(x=D1)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D1 Information", subtitle="D1 Less Than 500") +
+  theme_bw() 
+
+plot2 <- train_set %>% filter(D2 < 600) %>%
+  ggplot(aes(x=D2)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D2 Information", subtitle="D2 Less Than 600") +
+  theme_bw() 
+
+
+plot3 <- train_set %>% filter(D3 < 100) %>%
+  ggplot(aes(x=D3)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D3 Information", subtitle="D3 Less Than 100") +
+  theme_bw() 
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3)
+```
+
+
+
+```{r, message = FALSE, warning = FALSE, fig.height = 3, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% filter(D4 < 600) %>%
+  ggplot(aes(x=D4)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D4 Information", subtitle="D4 Less Than 600") +
+  theme_bw() 
+
+plot2 <- train_set %>% filter(D5 < 300) %>%
+  ggplot(aes(x=D5)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D5 Information", subtitle="D5 Less Than 300") +
+  theme_bw() 
+
+
+plot3 <- train_set %>% filter(D6 < 400) %>%
+  ggplot(aes(x=D6)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D6 Information", subtitle="D6 Less Than 400") +
+  theme_bw() 
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3)
+```
+
+
+```{r, message = FALSE, warning = FALSE, fig.height = 3, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% filter(D7 < 300) %>%
+  ggplot(aes(x=D7)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D7 Information", subtitle="D7 Less Than 300") +
+  theme_bw() 
+
+plot2 <- train_set %>% filter(D8 < 700) %>%
+  ggplot(aes(x=D8)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D8 Information", subtitle="D8 Less Than 700") +
+  theme_bw() 
+
+
+plot3 <- train_set %>% 
+  ggplot(aes(x=D9)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D9 Information") +
+  theme_bw() 
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3)
+```
+
+
+```{r, message = FALSE, warning = FALSE, fig.height = 3, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% filter(D10 < 500) %>%
+  ggplot(aes(x=D10)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D10 Information", subtitle="D10 Less Than 500") +
+  theme_bw() 
+
+plot2 <- train_set %>% filter(D11 < 500) %>%
+  ggplot(aes(x=D11)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D11 Information", subtitle="D11 Less Than 500") +
+  theme_bw() 
+
+
+plot3 <- train_set %>% filter(D12 < 400) %>%
+  ggplot(aes(x=D12)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D12 Information", subtitle="D12 Less Than 400") +
+  theme_bw()  
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3)
+```
+
+
+```{r, message = FALSE, warning = FALSE, fig.height = 3, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% filter(D13 < 100) %>%
+  ggplot(aes(x=D13)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D13 Information", subtitle="D13 Less Than 100") +
+  theme_bw() 
+
+plot2 <- train_set %>% filter(D14 < 400) %>%
+  ggplot(aes(x=D14)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D14 Information", subtitle="D14 Less Than 400") +
+  theme_bw() 
+
+
+plot3 <- train_set %>% filter(D15 < 600) %>%
+  ggplot(aes(x=D15)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("D15 Information", subtitle="D15 Less Than 600") +
+  theme_bw()  
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3)
+```
+
+
+### M
+
+> This section consists of 9 features (M1 - M9)
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+M1_freq <- train_set %>% group_by(M1) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot1 <- ggplot(M1_freq, aes(x = reorder(M1, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M1", subtitle="Including normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+fraud_M1_freq <- train_set[train_set$isFraud==1, ] %>% group_by(M1) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot2 <- ggplot(fraud_M1_freq, aes(x = reorder(M1, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M1", subtitle="Excluding normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2, M1_freq, fraud_M1_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+M2_freq <- train_set %>% group_by(M2) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot1 <- ggplot(M2_freq, aes(x = reorder(M2, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M2", subtitle="Including normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+fraud_M2_freq <- train_set[train_set$isFraud==1, ] %>% group_by(M2) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot2 <- ggplot(fraud_M2_freq, aes(x = reorder(M2, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M2", subtitle="Excluding normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2, M2_freq, fraud_M2_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+M3_freq <- train_set %>% group_by(M3) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot1 <- ggplot(M3_freq, aes(x = reorder(M3, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M3", subtitle="Including normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+fraud_M3_freq <- train_set[train_set$isFraud==1, ] %>% group_by(M3) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot2 <- ggplot(fraud_M3_freq, aes(x = reorder(M3, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M3", subtitle="Excluding normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2, M3_freq, fraud_M3_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+M4_freq <- train_set %>% group_by(M4) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot1 <- ggplot(M4_freq, aes(x = reorder(M4, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M4", subtitle="Including normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+fraud_M4_freq <- train_set[train_set$isFraud==1, ] %>% group_by(M4) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot2 <- ggplot(fraud_M4_freq, aes(x = reorder(M4, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M4", subtitle="Excluding normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2, M4_freq, fraud_M4_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+M5_freq <- train_set %>% group_by(M5) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot1 <- ggplot(M5_freq, aes(x = reorder(M5, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M5", subtitle="Including normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+fraud_M5_freq <- train_set[train_set$isFraud==1, ] %>% group_by(M5) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot2 <- ggplot(fraud_M5_freq, aes(x = reorder(M5, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M5", subtitle="Excluding normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2, M5_freq, fraud_M5_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+M6_freq <- train_set %>% group_by(M6) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot1 <- ggplot(M6_freq, aes(x = reorder(M6, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M6", subtitle="Including normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+fraud_M6_freq <- train_set[train_set$isFraud==1, ] %>% group_by(M6) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot2 <- ggplot(fraud_M6_freq, aes(x = reorder(M6, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M6", subtitle="Excluding normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2, M6_freq, fraud_M6_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+M7_freq <- train_set %>% group_by(M7) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot1 <- ggplot(M7_freq, aes(x = reorder(M7, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M7", subtitle="Including normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+fraud_M7_freq <- train_set[train_set$isFraud==1, ] %>% group_by(M7) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot2 <- ggplot(fraud_M7_freq, aes(x = reorder(M7, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M7", subtitle="Excluding normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2, M7_freq, fraud_M7_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+M8_freq <- train_set %>% group_by(M8) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot1 <- ggplot(M8_freq, aes(x = reorder(M8, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M8", subtitle="Including normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+fraud_M8_freq <- train_set[train_set$isFraud==1, ] %>% group_by(M8) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot2 <- ggplot(fraud_M8_freq, aes(x = reorder(M8, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M8", subtitle="Excluding normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2, M8_freq, fraud_M8_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2, fig.width = 10, echo=FALSE}
+M9_freq <- train_set %>% group_by(M9) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot1 <- ggplot(M9_freq, aes(x = reorder(M9, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M9", subtitle="Including normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+fraud_M9_freq <- train_set[train_set$isFraud==1, ] %>% group_by(M9) %>% summarise(n=n()) %>% mutate(freq = n / sum(n) * 100, rel.freq = paste0(round(100 * n/sum(n), 0), "%"))
+plot2 <- ggplot(fraud_M9_freq, aes(x = reorder(M9, -freq), y = freq)) +
+  geom_bar(fill = "#0073C2FF", stat = "identity", alpha=0.3) + 
+  geom_text(aes(label = rel.freq), vjust = -0.2) +
+  labs(x="", y="") +
+  ggtitle("Transactions By M9", subtitle="Excluding normal transactions") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  coord_flip()
+
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2, M9_freq, fraud_M9_freq)
+```
+
+
+### ID
+> In the dataset, there are 39 different features that represent ID's of each transaction. We will explore them one by one in this section.
+
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2.5, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% 
+  ggplot(aes(x=id_01)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_01 Information") +
+  theme_bw() 
+
+plot2 <- train_set %>% 
+  ggplot(aes(x=id_02)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_02 Information") +
+  theme_bw() 
+
+plot3 <- train_set %>% 
+  ggplot(aes(x=id_03)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_03 Information") +
+  theme_bw()  
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2.5, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% 
+  ggplot(aes(x=id_04)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_04 Information") +
+  theme_bw() 
+
+plot2 <- train_set %>% 
+  ggplot(aes(x=id_05)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_05 Information") +
+  theme_bw() 
+
+plot3 <- train_set %>% 
+  ggplot(aes(x=id_06)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_06 Information") +
+  theme_bw()  
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2.5, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% 
+  ggplot(aes(x=id_07)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_07 Information") +
+  theme_bw() 
+
+plot2 <- train_set %>% 
+  ggplot(aes(x=id_08)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_08 Information") +
+  theme_bw() 
+
+plot3 <- train_set %>% 
+  ggplot(aes(x=id_09)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_09 Information") +
+  theme_bw()  
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2.7, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% 
+  ggplot(aes(x=id_10)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_10 Information") +
+  theme_bw() 
+
+plot2 <- train_set %>% 
+  ggplot(aes(x=id_11)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_11 Information") +
+  theme_bw() 
+
+id_12_freq <- train_set %>% group_by(id_12) %>% summarise(counts=n()) %>% arrange(counts)
+plot3 <- ggplot(id_12_freq, aes(x = id_12, y = counts, fill=id_12)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_12 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw()  
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3, id_12_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2.7, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% 
+  ggplot(aes(x=id_13)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_13 Information") +
+  theme_bw() 
+
+plot2 <- train_set %>% 
+  ggplot(aes(x=id_14)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_14 Information") +
+  theme_bw() 
+
+id_15_freq <- train_set %>% group_by(id_15) %>% summarise(counts=n()) %>% arrange(counts)
+plot3 <- ggplot(id_15_freq, aes(x = id_15, y = counts, fill=id_15)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_15 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw()   
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3, id_15_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2.7, fig.width = 10, echo=FALSE}
+id_16_freq <- train_set %>% group_by(id_16) %>% summarise(counts=n()) %>% arrange(counts)
+plot1 <- ggplot(id_16_freq, aes(x = id_16, y = counts, fill=id_16)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_16 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw()  
+
+plot2 <- train_set %>% 
+  ggplot(aes(x=id_17)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_17 Information") +
+  theme_bw() 
+
+
+plot3 <- train_set %>% 
+  ggplot(aes(x=id_18)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_18 Information") +
+  theme_bw() 
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3, id_16_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2.5, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% 
+  ggplot(aes(x=id_19)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_19 Information") +
+  theme_bw() 
+
+plot2 <- train_set %>% 
+  ggplot(aes(x=id_20)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_20 Information") +
+  theme_bw() 
+
+plot3 <- train_set %>% 
+  ggplot(aes(x=id_21)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_21 Information") +
+  theme_bw()  
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2.7, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% 
+  ggplot(aes(x=id_22)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_22 Information") +
+  theme_bw() 
+
+id_23_freq <- train_set %>% group_by(id_23) %>% summarise(counts=n()) %>% arrange(counts)
+plot2 <- ggplot(id_23_freq, aes(x = id_23, y = counts, fill=id_23)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  scale_x_discrete(labels=c("ANONYMOUS", "HIDDEN", "TRANSPARENT", "NA")) +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_23 Information", subtitle="IP_PROXY") +
+  scale_y_continuous(labels = comma) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+plot3 <- train_set %>% 
+  ggplot(aes(x=id_24)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_24 Information") +
+  theme_bw() 
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3, id_23_freq)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2.7, fig.width = 10, echo=FALSE}
+plot1 <- train_set %>% 
+  ggplot(aes(x=id_25)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_25 Information") +
+  theme_bw()
+
+plot2 <- train_set %>% 
+  ggplot(aes(x=id_26)) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE", alpha=0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_26 Information") +
+  theme_bw() 
+
+id_27_freq <- train_set %>% group_by(id_27) %>% summarise(counts=n()) %>% arrange(counts)
+plot3 <- ggplot(id_27_freq, aes(x = id_27, y = counts, fill=id_27)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_27 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw()  
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3, id_27_freq)
+```
+
+Before we plot the next three features, let's see what levels ID_30 has first. 
+```{r, message = FALSE, warning = FALSE}
+table(train_set$id_30, useNA = 'ifany')
+```
+As you can see, this feature contains data on operating systems. We can group them into major releases. For example, we can group Android 5.0.2 and Android 5.1.1 into Android 5.0. This way, this feature will have 29 levels. But each levels will still have relatively small values compared to the the number of NA. So, we will drop this feature, and instead, use DeviceInfo which carries very similar information to avoid overfitting. 
+```{r, message = FALSE, warning = FALSE}
+train_set$id_30 <- NULL    
+test_set$id_30 <- NULL
+```
+
+
+Also, let's take a look at ID_31.  
+```{r, message = FALSE, warning = FALSE}
+table(train_set$id_31, useNA = 'ifany') %>% sort()
+```
+You can observe that, as ID_30, the levels can be grouped together into major web browsers. For instance, "chrome 43.0 for android" and "chrome 46.0 for android" can be grouped together and called "android". Since no previous features have data on web browsers, we will use this feature.
+```{r, message = FALSE, warning = FALSE}
+# Chrome
+train_set[grep("chrome", train_set$id_31), 'id_31'] <- "Chrome"
+test_set[grep("chrome", test_set$id_31), 'id_31'] <- "Chrome"
+
+# Firefox
+train_set[grep("firefox", train_set$id_31), 'id_31'] <- "Firefox"
+test_set[grep("firefox", test_set$id_31), 'id_31'] <- "Firefox"
+
+# Edge
+train_set[grep("edge", train_set$id_31), 'id_31'] <- "Edge"
+test_set[grep("edge", test_set$id_31), 'id_31'] <- "Edge"
+
+# Samsung Browser
+train_set[grep("samsung browser", train_set$id_31), 'id_31'] <- "Samsung Browser"
+test_set[grep("samsung browser", test_set$id_31), 'id_31'] <- "Samsung Browser"
+
+# Safari
+train_set[grep("safari", train_set$id_31), 'id_31'] <- "Safari"
+test_set[grep("safari", test_set$id_31), 'id_31'] <- "Safari"
+
+# Internet Explorer
+train_set[grep("ie 11.0", train_set$id_31), 'id_31'] <- "Internet Explorer"
+test_set[grep("ie 11.0", test_set$id_31), 'id_31'] <- "Internet Explorer"
+```
+
+
+We will keep 6 most frequently appeared levels, and lump the other levels into one level called "Other". 
+```{r, message = FALSE, warning = FALSE}
+train_set %<>% mutate(id_31=fct_lump(id_31, n=6))
+test_set %<>% mutate(id_31=fct_lump(id_31, n=6))
+```
+
+
+
+```{r, message = FALSE, warning = FALSE, fig.height = 3.5, fig.width = 10, echo=FALSE}
+id_28_freq <- train_set %>% group_by(id_28) %>% summarise(counts=n()) %>% arrange(counts)
+plot1 <- ggplot(id_28_freq, aes(x = id_28, y = counts, fill=id_28)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_28 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw() 
+
+id_29_freq <- train_set %>% group_by(id_29) %>% summarise(counts=n()) %>% arrange(counts)
+plot2 <- ggplot(id_29_freq, aes(x = id_29, y = counts, fill=id_29)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_29 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw()  
+
+id_31_freq <- train_set %>% group_by(id_31) %>% summarise(counts=n()) %>% arrange(desc(counts))
+plot3 <- ggplot(id_31_freq, aes(x = reorder(id_31, counts), y = counts, fill=id_31)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_31 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_flip()
+
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3, id_28_freq, id_29_freq, id_31_freq)
+```
+
+
+
+Convert ID_32 to a character variable to make a barplot
+```{r, message = FALSE, warning = FALSE}
+train_set %<>% mutate(id_32 = as.character(id_32))
+test_set %<>% mutate(id_32 = as.character(id_32))
+```
+
+
+
+ID_33 has 237 levels including <NA>. 
+```{r, message = FALSE, warning = FALSE}
+table(train_set$id_33, useNA = 'ifany') %>% sort()
+```
+One of the levels are "0x0" which doesn't make sense. We will convert the level to <NA>. 
+```{r, message = FALSE, warning = FALSE}
+train_set$id_33[train_set$id_33 == "0x0"] <- NA
+test_set$id_33[test_set$id_33 == "0x0"] <- NA
+```
+
+We will keep 15 levels that have more than 1000 of transaction records, and lump the other levels into one level called "Other". 
+```{r, message = FALSE, warning = FALSE}
+train_set %<>% mutate(id_33=fct_lump(id_33, n=15))
+test_set %<>% mutate(id_33=fct_lump(id_33, n=15))
+```
+
+
+
+
+
+```{r, message = FALSE, warning = FALSE, fig.height = 3.5, fig.width = 10, echo=FALSE}
+id_32_freq <- train_set %>% group_by(id_32) %>% summarise(counts=n()) %>%  arrange(desc(counts))
+plot1 <- ggplot(id_32_freq, aes(x = reorder(id_32, counts), y = counts, fill=id_32)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_32 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw()
+
+
+id_33_freq <- train_set %>% group_by(id_33) %>% summarise(counts=n()) %>%  arrange(desc(counts))
+plot2 <- ggplot(id_33_freq, aes(x = reorder(id_33, counts), y = counts, fill=id_33)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_33 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw() +
+  coord_flip()
+
+
+
+grid.arrange(plot1, plot2, nrow=1)
+rm(plot1, plot2, id_32_freq, id_33_freq)
+```
+
+
+
+```{r, message = FALSE, warning = FALSE, fig.height = 3.5, fig.width = 10, echo=FALSE}
+id_34_freq <- train_set %>% group_by(id_34) %>% summarise(counts=n()) %>% arrange(counts)
+plot1 <- ggplot(id_34_freq, aes(x = id_34, y = counts, fill=id_34)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_34 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+id_35_freq <- train_set %>% group_by(id_35) %>% summarise(counts=n()) %>% arrange(counts)
+plot2 <- ggplot(id_35_freq, aes(x = id_35, y = counts, fill=id_35)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_35 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw()  
+
+id_36_freq <- train_set %>% group_by(id_36) %>% summarise(counts=n()) %>% arrange(desc(counts))
+plot3 <- ggplot(id_36_freq, aes(x = reorder(id_36, counts), y = counts, fill=id_36)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_36 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw()
+
+
+grid.arrange(plot1, plot2, plot3, nrow=1)
+
+rm(plot1, plot2, plot3, id_34_freq, id_35_freq, id_36_freq)
+```
+It's interesting to see that when match_status gets larger in ID_34, the number of transactions significantly increase. Also, ID_35 and ID_36 have the same number of NA, but there is a huge gap between FALSE from ID_35 and FALSE from ID_36.  
+
+
+```{r, message = FALSE, warning = FALSE, fig.height = 2.7, fig.width = 10, echo=FALSE}
+id_37_freq <- train_set %>% group_by(id_37) %>% summarise(counts=n()) %>% arrange(counts)
+plot1 <- ggplot(id_37_freq, aes(x = id_37, y = counts, fill=id_37)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_37 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw()  
+
+id_38_freq <- train_set %>% group_by(id_38) %>% summarise(counts=n()) %>% arrange(desc(counts))
+plot2 <- ggplot(id_38_freq, aes(x = reorder(id_38, counts), y = counts, fill=id_38)) +
+  geom_bar(stat = "identity", color="blue", fill=rgb(0.1,0.4,0.5,0.7), alpha=0.4) + 
+  scale_fill_brewer() +
+  geom_text(aes(label = counts), vjust = -0.01) +
+  labs(x="", y="Transactions") +
+  ggtitle("ID_38 Information") +
+  scale_y_continuous(labels = comma) +
+  theme_bw()
+
+
+grid.arrange(plot1, plot2, nrow=1)
+
+rm(plot1, plot2, id_37_freq, id_38_freq)
+```
+
+
+
+
+
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+train_set$id_31[grep("firefox ", train_set$id_31)] %>% length()
+
+
+```
+
+
+
+
+
+
+
+
+
+### V 
+
+Let's take a look at the first 10 V's. There are some exceptions, but you can see that as the level increases from "1", the proportion decreases. Not only the first 10 features, but the remaining features are also showing the same pattern.  
+
+V1
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+table(train_set$V1, useNA = 'ifany')%>% sort()/ length(train_set$V1) 
+```
+V2
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+table(train_set$V2, useNA = 'ifany') %>% sort()/ length(train_set$V2) 
+```
+V3
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+table(train_set$V3, useNA = 'ifany') %>% sort()/ length(train_set$V3) 
+```
+V4
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+table(train_set$V4, useNA = 'ifany') %>% sort()/ length(train_set$V4) 
+```
+V5
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+table(train_set$V5, useNA = 'ifany') %>% sort()/ length(train_set$V5) 
+```
+V6
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+table(train_set$V6, useNA = 'ifany') %>% sort()/ length(train_set$V6) 
+```
+V7
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+table(train_set$V7, useNA = 'ifany') %>% sort()/ length(train_set$V7) 
+```
+V8
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+table(train_set$V8, useNA = 'ifany') %>% sort()/ length(train_set$V8) 
+```
+V9
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+table(train_set$V9, useNA = 'ifany') %>% sort()/ length(train_set$V9) 
+```
+V10
+```{r, message = FALSE, warning = FALSE, echo=FALSE}
+table(train_set$V10, useNA = 'ifany') %>% sort()/ length(train_set$V10) 
+```
+
+
+
+
+
+***
+
+# 4 Data Cleaning & Feature Engineering
+
+When classifying transactions, Transaction ID's are not needed. So we are going to drop the "TransactionID". Also, variables that have too many missing values can cause problems when building a model. We saw earlier that 13 variables have 90% of missing values. We will drop them as well. 
+```{r, message = FALSE, warning = FALSE}
+train_set %<>% select(-TransactionID,-id_24, -id_25, -id_07, -id_08, -id_27, -id_21, -id_26, -id_22, -id_23, -id_12, -dist2, -D7, -id_18) 
+test_set %<>% select(-TransactionID,-id_24, -id_25, -id_07, -id_08, -id_27, -id_21, -id_26, -id_22, -id_23, -id_12, -dist2, -D7, -id_18) 
+```
+
+
+We observed in subsection called "TransactionAMT" from Exploratory Data Analysis that transactions of which transaction amount with third places were most likely made outside the U.S. We will create a new feature called decimal3 based on the "which_TransactionAmt_chr". If a transaction has third decimal places, decimal3 is 1, and 0 otherwise. 
+```{r, message = FALSE, warning = FALSE}
+TransactionAmt_chr_train <- str_sub(format(round(train_set$TransactionAmt, 3), nsmall=3), start=-1)
+which_TransactionAmt_chr_train <- which(TransactionAmt_chr_train != 0)
+TransactionAmt_chr_test <- str_sub(format(round(test_set$TransactionAmt, 3), nsmall=3), start=-1)
+which_TransactionAmt_chr_test <- which(TransactionAmt_chr_test != 0)
+
+
+train_set$decimal3 <- "No"
+train_set$decimal3[which_TransactionAmt_chr_train] <- "Yes"
+
+test_set$decimal3 <- "No"
+test_set$decimal3[which_TransactionAmt_chr_test] <- "Yes"
+```
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+rm(TransactionAmt_chr_train, TransactionAmt_chr_test, which_TransactionAmt_chr_train, which_TransactionAmt_chr_test)
+```
+
+
+First, our target variable, "isFraud", should be converted to factor variable. Also, "card3", "card5", "addr1" and "addr2" seem like categorical variables, as they clearly have some peaks without any pattern. The other values have very minor number of transactions. So we will convert the features to categorical features. And we will keep some of major levels and lump the other minor levels into one level called "Other"
+```{r, message = FALSE, warning = FALSE}
+
+cols_toFactor <- c("isFraud", "card3", "card5", "addr1", "addr2")
+train_set %<>% mutate_each_(funs(factor(.)),cols_toFactor)
+test_set %<>% mutate_each_(funs(factor(.)),cols_toFactor)
+
+train_set %<>% mutate(card3=fct_lump(card3, n=3),
+                      card5=fct_lump(card5, n=10),
+                      addr1=fct_lump(addr1, n=14),
+                      addr2=fct_lump(addr2, n=5))
+test_set %<>% mutate(card3=fct_lump(card3, n=3), 
+                     card5=fct_lump(card5, n=10),
+                     addr1=fct_lump(addr1, n=14),
+                     addr2=fct_lump(addr2, n=5))
+```
+
+
+
+
+
+
+Some major domains such as yahoo and hotmail have several local domain that represent their location. For instance, there are 7 different domains that belong to Yahoo including "yahoo.com.mx" and "yahoo.de". Since we have features related to address or location, we won't need to have the local domain separately. We will change such domains to their main domains. 
+```{r, message = FALSE, warning = FALSE}
+# Gmail
+train_set[grep("gmail", train_set$P_emaildomain), 'P_emaildomain'] <- "gmail.com"
+test_set[grep("gmail", test_set$P_emaildomain), 'P_emaildomain'] <- "gmail.com"
+train_set[grep("gmail", train_set$R_emaildomain), 'R_emaildomain'] <- "gmail.com"
+test_set[grep("gmail", test_set$R_emaildomain), 'R_emaildomain'] <- "gmail.com"
+
+# Yahoo
+train_set[grep("yahoo", train_set$P_emaildomain), 'P_emaildomain'] <- "yahoo.com"
+test_set[grep("yahoo", test_set$P_emaildomain), 'P_emaildomain'] <- "yahoo.com"
+train_set[grep("yahoo", train_set$R_emaildomain), 'R_emaildomain'] <- "yahoo.com"
+test_set[grep("yahoo", test_set$R_emaildomain), 'R_emaildomain'] <- "yahoo.com"
+
+# Hotmail
+train_set[grep("hotmail", train_set$P_emaildomain), 'P_emaildomain'] <- "hotmail.com"
+test_set[grep("hotmail", test_set$P_emaildomain), 'P_emaildomain'] <- "hotmail.com"
+train_set[grep("hotmail", train_set$R_emaildomain), 'R_emaildomain'] <- "hotmail.com"
+test_set[grep("hotmail", test_set$R_emaildomain), 'R_emaildomain'] <- "hotmail.com"
+
+# Outlook
+train_set[grep("outlook", train_set$P_emaildomain), 'P_emaildomain'] <- "outlook.com"
+test_set[grep("outlook", test_set$P_emaildomain), 'P_emaildomain'] <- "outlook.com"
+train_set[grep("outlook", train_set$R_emaildomain), 'R_emaildomain'] <- "outlook.com"
+test_set[grep("outlook", test_set$R_emaildomain), 'R_emaildomain'] <- "outlook.com"
+
+# Live
+train_set[grep("live", train_set$P_emaildomain), 'P_emaildomain'] <- "live.com"
+test_set[grep("live", test_set$P_emaildomain), 'P_emaildomain'] <- "live.com"
+train_set[grep("live", train_set$R_emaildomain), 'R_emaildomain'] <- "live.com"
+test_set[grep("live", test_set$R_emaildomain), 'R_emaildomain'] <- "live.com"
+```
+
+We will keep 10 most frequently appeared levels, and lump the other levels into one level called "Other". 
+```{r, message = FALSE, warning = FALSE}
+train_set %<>% mutate(P_emaildomain=fct_lump(P_emaildomain, n=10), 
+                      R_emaildomain=fct_lump(R_emaildomain, n=10))
+test_set %<>% mutate(P_emaildomain=fct_lump(P_emaildomain, n=10), 
+                     R_emaildomain=fct_lump(R_emaildomain, n=10))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r, message = FALSE, warning = FALSE}
+glimpse(train_set)
+```
+
+Convert character variables to factor variables and check which features are factor variables. 
+```{r, message = FALSE, warning = FALSE}
+train_set %<>% mutate_if(is.character, factor) %>% mutate(ProductCD=factor(ProductCD),card4=factor(card4),card6=factor(card6),M4=factor(M4),id_15=factor(id_15),id_16=factor(id_16),id_28=factor(id_28),id_29=factor(id_29),id_32=factor(id_32),id_34=factor(id_34),DeviceType=factor(DeviceType),decimal3=factor(decimal3))
+
+test_set %<>% mutate_if(is.character, factor) %>% mutate(ProductCD=factor(ProductCD),card4=factor(card4),card6=factor(card6),M4=factor(M4),id_15=factor(id_15),id_16=factor(id_16),id_28=factor(id_28),id_29=factor(id_29),id_32=factor(id_32),id_34=factor(id_34),DeviceType=factor(DeviceType),decimal3=factor(decimal3))
+
+
+
+factor_variables <- names(train_set)[sapply(train_set, class) == "factor"]
+# We do not need isFraud in this list
+#factor_variables <- factor_variables[2:25]
+```
+
+
+And then we will use label encoder to the factor variables
+```{r, message = FALSE, warning = FALSE}
+train_set[, factor_variables] <- lapply(train_set[, factor_variables], as.integer)
+test_set[, factor_variables] <- lapply(test_set[, factor_variables], as.integer)
+
+```
+
+
+Also change the numeric and logical features to integer 
+```{r, message = FALSE, warning = FALSE}
+num_variables <- names(train_set)[sapply(train_set, class) == "numeric"]
+train_set[, num_variables] <- lapply(train_set[, num_variables], as.integer)
+test_set[, num_variables] <- lapply(test_set[, num_variables], as.integer)
+
+
+logical_variables <- names(train_set)[sapply(train_set, class) == "logical"]
+train_set[, logical_variables] <- lapply(train_set[, logical_variables], as.integer)
+test_set[, logical_variables] <- lapply(test_set[, logical_variables], as.integer)
+```
+
+
+
+
+
+
+
+
+
