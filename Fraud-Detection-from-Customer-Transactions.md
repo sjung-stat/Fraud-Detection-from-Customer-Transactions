@@ -25,7 +25,7 @@ However, this digital payment system has a serious problem; exposure to
 fraud transactions. And this
 [article](https://www.paymentssource.com/opinion/coronavirus-increases-exposure-for-digital-payments-fraud)
 suggests that “coronavirus increases exposure for digital payments
-fraud.” Such fraud tranasctions So, many experts are trying to develop
+fraud.” So, many experts are trying to develop
 methods to decrease the number of fraud transactions.
 
 In this project, we build models that predict whether a transaction is a
