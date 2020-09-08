@@ -37,9 +37,12 @@ You can download the dataset used in this project [here](https://www.kaggle.com/
 
 #### Why use LightGBM and CatBoost for this project? 
 
+First, both LightGBM and CatBoost can handle missing values internally. Majority of features from the dataset have missing values. And you will see that the the proportion of missing values of 13 of them are higher than 90%. Since we do not have to take care of missing values manually, it saves a lot of trouble. Also, the training time of both algorithms is relatively faster than other classification algorithms. Since we have approximately 590k observations, a faster computation is a great advantage. And both algorithms, especially, CatBoost, is very useful when variables are categorical, because they have their own method to deal with categorical features. Since we already have 400+ features, it would be computationally very heavy to use One Hot Encoding. So this makes the training a lot easier. 
 
 
+-----
 
+### Conclusion
 
 
 
