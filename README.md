@@ -43,10 +43,10 @@ First, CatBoost can handle missing values internally. Majority of features from 
 -----
 
 ### Conclusion
-
+![](CatBoost result.png "Title")
 I used the “Log Loss” metric for this classification modeling and I achieved logloss=0.05298 with 10,000 iterations. The dataset is very imbalanced; the proportion of our target feature is approximately 96.5:3.5. Given this proportion, the approximate log loss of a baseline model is between 0.13 and 0.2, according to this [article](https://medium.com/@fzammito/whats-considered-a-good-log-loss-in-machine-learning-a529d400632d). So the result from validation set is great. However, the computation was still too heavy for my machine; it took 10+ hours to train the data. 
 
-
+![](feature importance.png "Title")
 Also, according to this [document](https://catboost.ai/docs/concepts/fstr.html#fstr), the feature importance "shows how much on average the prediction changes if the feature value changes. The bigger the value of the importance the bigger on average is the change to the prediction value, if this feature is changed." The feature importance part gives us an interesting result; TransactionDT (transaction timedelta from a given reference datetime), TransactionAMT (transaction amount), card1 (unknown), and card2 (unknown) are the most important features. So, even though the detailed information regarding card1 and card2 are unknown, they play an essential role when detecting fraudulent transactions. 
 
 Please note that due to the general performance of my computer, I am currently not able to perform the parameter tuning. Once I upgrade my machine, I will try to optimize the model by tuning hyperparameters and then improve its performance again.
