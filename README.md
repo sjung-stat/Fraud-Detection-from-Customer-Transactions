@@ -92,8 +92,7 @@ Encoding. So this makes the training a lot easier.
 
 I used the “Log Loss” metric for this classification modeling and I
 achieved logloss=0.05298 with 10,000 iterations. The dataset is very
-imbalanced; the proportion of our target feature is approximately
-96.5:3.5. Given this proportion, the approximate log loss of a baseline
+imbalanced. Given this proportion, the approximate log loss of a baseline
 model is 0.152 with 96.5%/3.5% split for target variable. So the result from validation set is great. However, the computation was
 still too heavy for my machine; it took 10+ hours to train the data.
 
