@@ -62,14 +62,13 @@ the other two famous boosted-based algorithms, XGBoost and LightGBM,
 
 You can download the dataset used in this project
 [here](https://www.kaggle.com/c/ieee-fraud-detection/data). Please note
-that we use the train\_identity and train\_transaction datasets only. -
-The training set is comprised of 590k of transaction information and 435
-features such as the transaction amount, product code, and address. -
-The target variable is “isFraud”. - The Descriptions of the features can
-be found
-[here](https://www.kaggle.com/c/ieee-fraud-detection/discussion/101203).
-But please note that detailed description is not available at this
-moment.
+that we use the train\_identity and train\_transaction datasets only. 
+- The training set is comprised of 590k of transaction information and 435
+features such as the transaction amount, product code, and address. 
+- The target variable is “isFraud”. 
+- The Descriptions of the features can be found [here](https://www.kaggle.com/c/ieee-fraud-detection/discussion/101203).
+
+But please note that detailed description is not available at this moment.
 
 #### Why use CatBoost for this project?
 
