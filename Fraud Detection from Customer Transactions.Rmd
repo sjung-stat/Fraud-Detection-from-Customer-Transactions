@@ -50,6 +50,7 @@ library(magrittr)     # %<>% pipeline
 library(forcats)      # fct_lump
 library(lightgbm)
 library(Matrix)       #s parse.model.matrix
+library(catboost)
 ```
 
 And read dataset into R. Before we join the two dataset, we will create a new column called "isID" to identify which rows are from id_data. 
@@ -73,7 +74,7 @@ names(data_joined)[names(data_joined) == "isID.y"] <- "isID"
 data_joined$isID[is.na(data_joined$isID)] <- 0
 ```
 
-Let's have a look at the structure of the datasets
+Let's have a look at the structure of the dataset
 ```{r, message = FALSE, warning = FALSE}
 glimpse(data_joined)  # 590540 obs. of  435 variables
 ```
@@ -1891,52 +1892,50 @@ test_set %<>% mutate(P_emaildomain=fct_lump(P_emaildomain, n=10),
 ```
 
 
+***
+
+# 5 Model Building
 
 
-
-
-
-
-
-
-
+### CatBoost
 
 ```{r, message = FALSE, warning = FALSE}
-glimpse(train_set)
-```
+train_ind <- train_set %>% select(-isFraud)
+train_label <- as.numeric(train_set$isFraud) - 1
 
-Convert character variables to factor variables and check which features are factor variables. 
-```{r, message = FALSE, warning = FALSE}
-train_set %<>% mutate_if(is.character, factor) %>% mutate(ProductCD=factor(ProductCD),card4=factor(card4),card6=factor(card6),M4=factor(M4),id_15=factor(id_15),id_16=factor(id_16),id_28=factor(id_28),id_29=factor(id_29),id_32=factor(id_32),id_34=factor(id_34),DeviceType=factor(DeviceType),decimal3=factor(decimal3))
-
-test_set %<>% mutate_if(is.character, factor) %>% mutate(ProductCD=factor(ProductCD),card4=factor(card4),card6=factor(card6),M4=factor(M4),id_15=factor(id_15),id_16=factor(id_16),id_28=factor(id_28),id_29=factor(id_29),id_32=factor(id_32),id_34=factor(id_34),DeviceType=factor(DeviceType),decimal3=factor(decimal3))
+test_ind <- test_set %>% select(-isFraud)
+test_label <- as.numeric(test_set$isFraud) - 1
 
 
+# character to factor
+char_vars <- names(train_ind)[sapply(train_ind, is.character)]
+train_ind[, char_vars] <- lapply(train_ind[, char_vars], as.factor)
+test_ind[, char_vars] <- lapply(test_ind[, char_vars], as.factor)
 
-factor_variables <- names(train_set)[sapply(train_set, class) == "factor"]
-# We do not need isFraud in this list
-#factor_variables <- factor_variables[2:25]
-```
+# integer to double
+int_vars <- names(train_ind)[sapply(train_ind, is.integer)]
+train_ind[, int_vars] <- lapply(train_ind[, int_vars], as.double)
+test_ind[, int_vars] <- lapply(test_ind[, int_vars], as.double)
 
-
-And then we will use label encoder to the factor variables
-```{r, message = FALSE, warning = FALSE}
-train_set[, factor_variables] <- lapply(train_set[, factor_variables], as.integer)
-test_set[, factor_variables] <- lapply(test_set[, factor_variables], as.integer)
-
-```
-
-
-Also change the numeric and logical features to integer 
-```{r, message = FALSE, warning = FALSE}
-num_variables <- names(train_set)[sapply(train_set, class) == "numeric"]
-train_set[, num_variables] <- lapply(train_set[, num_variables], as.integer)
-test_set[, num_variables] <- lapply(test_set[, num_variables], as.integer)
-
-
+# logical to factor
 logical_variables <- names(train_set)[sapply(train_set, class) == "logical"]
-train_set[, logical_variables] <- lapply(train_set[, logical_variables], as.integer)
-test_set[, logical_variables] <- lapply(test_set[, logical_variables], as.integer)
+train_ind[, logical_variables] <- lapply(train_ind[, logical_variables], as.factor)
+test_ind[, logical_variables] <- lapply(test_ind[, logical_variables], as.factor)
+```
+
+
+```{r, message = FALSE, warning = FALSE}
+train_pool <- catboost.load_pool(data = train_ind, label = train_label)
+test_pool <- catboost.load_pool(data = test_ind, label = test_label)
+```
+
+
+
+```{r, message = FALSE, warning = FALSE}
+
+model <- catboost.train(train_pool,  test_pool,
+    params = list(loss_function = 'Logloss',
+         iterations = 10000, metric_period=100))
 ```
 
 
@@ -1944,6 +1943,20 @@ test_set[, logical_variables] <- lapply(test_set[, logical_variables], as.intege
 
 
 
+### Feature Importance
+
+```{r, message = FALSE, warning = FALSE}
+
+catboost.get_feature_importance(model, 
+                                pool = NULL, 
+                                type = 'FeatureImportance',
+                                thread_count = -1)
+```
 
 
 
+***
+
+# 6. Conclusion
+
+We used the "Log Loss" metric for this classification modeling. As you know, our dataset is very imbalanced; the proportion of our target feature is approximately 96.5:3.5. Given this proportion, the approximate log loss of a baseline model is between 0.13 and 0.2, according to this [article](https://medium.com/@fzammito/whats-considered-a-good-log-loss-in-machine-learning-a529d400632d). So the result from validation set is great.  
