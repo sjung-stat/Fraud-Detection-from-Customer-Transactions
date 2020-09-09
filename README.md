@@ -24,7 +24,7 @@ According to [this article](https://www.nerdwallet.com/article/credit-cards/merc
 
 I recently tried to purchase something online with my credit card. The merchandise was something that I had not bought before and the price was unusually expensive. Also, I was very far away from my home when I was placing an order online with the credit card. As a result, the transaction was denied and the bank sent me a notification to verify if the attempt was made by me. I was impressed that they could catch this unusual transaction in advance and deny them. And I also wanted to see if my own machine learning model could perform well. 
 
-In this independent project, we deal with customer transactions dataset provided by Vesta Corporation to predict which transactions are fraud. To accomplish this, we will build two machine learning models, LightGBM and CatBoost. You can find more information about LightGBM [here](https://lightgbm.readthedocs.io/en/latest/) and CatBoost [here](https://catboost.ai/). You can find the comparison of the two algorithms [here](https://medium.com/riskified-technology/xgboost-lightgbm-or-catboost-which-boosting-algorithm-should-i-use-e7fda7bb36bc). 
+In this independent project, we deal with customer transactions dataset provided by Vesta Corporation to predict which transactions are fraud. To accomplish this, we will build a machine learning model, CatBoost. You can find more information about CatBoost [here](https://catboost.ai/). You can find the comparison of CatBoost to the other two famous boosted-based algorithms, XGBoost and LightGBM, [here](https://medium.com/riskified-technology/xgboost-lightgbm-or-catboost-which-boosting-algorithm-should-i-use-e7fda7bb36bc). 
 
 
 #### About the Data
@@ -37,7 +37,7 @@ You can download the dataset used in this project [here](https://www.kaggle.com/
 
 #### Why use CatBoost for this project? 
 
-First, CatBoost can handle missing values internally. Majority of features from the dataset have missing values. And you will see that the the proportion of missing values of 13 of them are higher than 90%. Since we do not have to take care of missing values manually, it saves a lot of trouble. Also, the training time of the algorithm is relatively faster than other classification algorithms. Since we have approximately 590k observations, a faster computation is a great advantage. And CatBoost is very useful when variables are categorical, because it has its own method to deal with categorical features. Since we already have 400+ features, it would be computationally very heavy to use One Hot Encoding. So this makes the training a lot easier. 
+First, CatBoost can handle missing values internally. Majority of features from the dataset have missing values. And you will see that the proportion of missing values of 13 of them are higher than 90%. Since we do not have to take care of missing values manually, it saves a lot of trouble. Also, the training time of the algorithm is relatively faster than other classification algorithms. Since we have approximately 590k observations, a faster computation is a great advantage. And CatBoost is very useful when variables are categorical, because it has its own method to deal with categorical features. Since we already have 400+ features, it would be computationally very heavy to use One Hot Encoding. So this makes the training a lot easier. 
 
 
 -----
